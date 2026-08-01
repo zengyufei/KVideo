@@ -7,12 +7,14 @@ import { Badge } from '@/components/ui/Badge';
 import { Icons } from '@/components/ui/Icon';
 import { LatencyBadge } from '@/components/ui/LatencyBadge';
 import { Button } from '@/components/ui/Button';
+import { Link2 } from 'lucide-react';
 import { useKeyboardNavigation } from '@/lib/hooks/useKeyboardNavigation';
 import { settingsStore } from '@/lib/store/settings-store';
 import type { VideoResolutionInfo } from './hooks/useVideoResolution';
 import type { ResolutionInfo } from '@/lib/hooks/useResolutionProbe';
 import { getCachedResolution } from '@/lib/player/resolution-cache';
 import { getSourceResolutionBadge, shouldExpandForCurrentSource } from '@/lib/player/source-list-utils';
+import { PlaybackLinksModal } from './PlaybackLinksModal';
 
 interface Episode {
   name?: string;
@@ -73,8 +75,8 @@ export function EpisodeList({
   // list = classic vertical list; grid = multi-column with section pages
   const [episodeLayout, setEpisodeLayout] = useState<'list' | 'grid'>('grid');
   const [episodePage, setEpisodePage] = useState(0);
-
   const EPISODES_PER_PAGE = 50;
+  const [showPlaybackLinks, setShowPlaybackLinks] = useState(false);
 
   // Source latency state
   const [latencies, setLatencies] = useState<Record<string, number>>({});
@@ -605,6 +607,17 @@ export function EpisodeList({
           <Badge variant="primary">{episodes.length}</Badge>
         )}
         <div className="ml-auto flex items-center gap-1.5">
+          {episodes && episodes.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowPlaybackLinks(true)}
+              className="flex h-8 w-8 items-center justify-center rounded-md border border-[var(--glass-border)] bg-[var(--glass-bg)] text-[var(--text-color-secondary)] transition-colors hover:bg-[var(--glass-hover)] hover:text-[var(--text-color)] cursor-pointer"
+              aria-label="获取播放链接"
+              title="获取播放链接"
+            >
+              <Link2 size={16} />
+            </button>
+          )}
           {/* Layout toggle */}
           {showReverseToggle && !episodeSectionCollapsed && (
             <button
@@ -751,6 +764,12 @@ export function EpisodeList({
           </div>
         </div>
       )}
+      <PlaybackLinksModal
+        isOpen={showPlaybackLinks}
+        episodes={episodes}
+        currentEpisode={currentEpisode}
+        onClose={() => setShowPlaybackLinks(false)}
+      />
     </Card>
   );
 }
