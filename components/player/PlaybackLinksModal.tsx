@@ -1,8 +1,13 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Check, Copy, Link2, X } from 'lucide-react';
-import { createPlaybackLinkItems, type PlaybackLinkEpisode } from '@/lib/player/playback-links';
+import { Check, Copy, Download, Link2, LoaderCircle, X } from 'lucide-react';
+import { useMediaDownload, type MediaDownloadState } from './hooks/useMediaDownload';
+import {
+  createPlaybackLinkItems,
+  type PlaybackLinkEpisode,
+  type PlaybackLinkItem,
+} from '@/lib/player/playback-links';
 
 interface PlaybackLinksModalProps {
   isOpen: boolean;
@@ -15,6 +20,135 @@ function getPlaybackLinkKey(index: number, url: string): string {
   return `${index}:${url}`;
 }
 
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** unit;
+  return `${value >= 100 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
+}
+
+function formatDownloadStatus(state: MediaDownloadState): string | null {
+  switch (state.phase) {
+    case 'preparing':
+      return '正在准备下载流';
+    case 'completed':
+      return '下载流已完成，浏览器正在保存文件';
+    case 'handed-off':
+      return '已交给浏览器原始下载';
+    case 'cancelled':
+      return '下载已取消';
+    case 'failed':
+      return state.error ? `下载失败：${state.error}` : '下载失败，请重试';
+    default:
+      return null;
+  }
+}
+
+interface LinkDownloadControlsProps {
+  item: PlaybackLinkItem;
+  isCopied: boolean;
+  onCopy: (index: number, url: string) => void;
+  downloadState: MediaDownloadState;
+  onStartDownload: (item: PlaybackLinkItem) => void;
+  onCancelDownload: (item: PlaybackLinkItem) => void;
+  withCopyLabel?: boolean;
+}
+
+function LinkDownloadControls({
+  item,
+  isCopied,
+  onCopy,
+  downloadState,
+  onStartDownload,
+  onCancelDownload,
+  withCopyLabel = false,
+}: LinkDownloadControlsProps) {
+  const isDownloading = downloadState.phase === 'preparing' || downloadState.phase === 'downloading';
+
+  return (
+    <>
+      <button
+        type="button"
+        onClick={() => onCopy(item.index, item.url)}
+        className={`inline-flex shrink-0 items-center justify-center gap-1 border border-[var(--glass-border)] text-[var(--text-color-secondary)] transition-colors hover:bg-[var(--glass-hover)] hover:text-[var(--text-color)] cursor-pointer ${withCopyLabel ? 'h-9 px-2 text-xs font-medium' : 'h-8 w-8'}`}
+        aria-label={`复制${item.name}链接`}
+        title={isCopied ? '已复制' : '复制链接'}
+      >
+        {isCopied ? <Check size={15} /> : <Copy size={15} />}
+        {withCopyLabel && <span>{isCopied ? '已复制' : '复制'}</span>}
+      </button>
+      {isDownloading ? (
+        <button
+          type="button"
+          onClick={() => onCancelDownload(item)}
+          className={`inline-flex shrink-0 items-center justify-center gap-1 border border-red-500/50 text-red-500 transition-colors hover:bg-red-500/10 cursor-pointer ${withCopyLabel ? 'h-9 px-2 text-xs font-medium' : 'h-8 w-8'}`}
+          aria-label={`取消${item.name}下载`}
+          title="取消下载"
+        >
+          <X size={15} />
+          {withCopyLabel && <span>取消</span>}
+        </button>
+      ) : (
+        <button
+          type="button"
+          onClick={() => onStartDownload(item)}
+          className={`inline-flex shrink-0 items-center justify-center gap-1 border border-[var(--glass-border)] text-[var(--text-color-secondary)] transition-colors hover:bg-[var(--glass-hover)] hover:text-[var(--text-color)] cursor-pointer ${withCopyLabel ? 'h-9 px-2 text-xs font-medium' : 'h-8 w-8'}`}
+          aria-label={`下载${item.name}`}
+          title={downloadState.phase === 'idle' ? '下载' : '重新下载'}
+        >
+          <Download size={15} />
+          {withCopyLabel && <span>{downloadState.phase === 'idle' ? '下载' : '重新下载'}</span>}
+        </button>
+      )}
+    </>
+  );
+}
+
+function DownloadStatus({ state }: { state: MediaDownloadState }) {
+  if (state.phase === 'downloading' && state.progress) {
+    const { completedChunks, totalChunks, downloadedBytes, bytesPerSecond } = state.progress;
+    const percentage = totalChunks > 0 ? Math.min((completedChunks / totalChunks) * 100, 100) : 0;
+
+    return (
+      <div className="mt-2" aria-live="polite">
+        <div className="flex items-center gap-1.5 text-xs text-[var(--text-color-secondary)]">
+          <LoaderCircle size={14} className="animate-spin" />
+          <span>下载中 {completedChunks}/{totalChunks} 个分片</span>
+          <span aria-hidden="true">·</span>
+          <span>{formatBytes(downloadedBytes)}</span>
+          <span aria-hidden="true">·</span>
+          <span>{formatBytes(bytesPerSecond)}/s</span>
+        </div>
+        <div
+          className="mt-1.5 h-1.5 overflow-hidden bg-black/10"
+          role="progressbar"
+          aria-label="下载进度"
+          aria-valuemin={0}
+          aria-valuemax={totalChunks}
+          aria-valuenow={completedChunks}
+          aria-valuetext={`${percentage.toFixed(0)}%`}
+        >
+          <div className="h-full bg-[var(--accent-color)] transition-[width]" style={{ width: `${percentage}%` }} />
+        </div>
+      </div>
+    );
+  }
+
+  const status = formatDownloadStatus(state);
+  if (!status) return null;
+
+  return (
+    <p
+      role={state.phase === 'failed' ? 'alert' : undefined}
+      className={`mt-2 text-xs ${state.phase === 'failed' ? 'text-red-500' : 'text-[var(--text-color-secondary)]'}`}
+    >
+      {status}
+    </p>
+  );
+}
+
 export function PlaybackLinksModal({
   isOpen,
   episodes,
@@ -23,6 +157,7 @@ export function PlaybackLinksModal({
 }: PlaybackLinksModalProps) {
   const [copiedLinkKey, setCopiedLinkKey] = useState<string | null>(null);
   const [copyErrorLinkKey, setCopyErrorLinkKey] = useState<string | null>(null);
+  const { getDownloadState, startDownload, cancelDownload } = useMediaDownload();
   const items = useMemo(
     () => createPlaybackLinkItems(episodes, currentEpisode),
     [episodes, currentEpisode]
@@ -119,17 +254,17 @@ export function PlaybackLinksModal({
               <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap bg-black/10 px-3 py-2 text-xs text-[var(--text-color)] select-all">
                 {currentItem.url}
               </code>
-              <button
-                type="button"
-                onClick={() => handleCopy(currentItem.index, currentItem.url)}
-                className="inline-flex h-9 shrink-0 items-center justify-center gap-1 border border-[var(--glass-border)] px-2 text-xs font-medium text-[var(--text-color)] transition-colors hover:bg-[var(--glass-hover)] cursor-pointer"
-                aria-label={`复制${currentItem.name}链接`}
-                title="复制链接"
-              >
-                {copiedLinkKey === currentLinkKey ? <Check size={15} /> : <Copy size={15} />}
-                <span>{copiedLinkKey === currentLinkKey ? '已复制' : '复制'}</span>
-              </button>
+              <LinkDownloadControls
+                item={currentItem}
+                isCopied={copiedLinkKey === currentLinkKey}
+                onCopy={handleCopy}
+                downloadState={getDownloadState(currentItem)}
+                onStartDownload={startDownload}
+                onCancelDownload={cancelDownload}
+                withCopyLabel
+              />
             </div>
+            <DownloadStatus state={getDownloadState(currentItem)} />
           </section>
 
           {hasCopyError && (
@@ -155,16 +290,16 @@ export function PlaybackLinksModal({
                     <code className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap bg-black/10 px-2 py-1.5 text-xs text-[var(--text-color)] select-all">
                       {item.url}
                     </code>
-                    <button
-                      type="button"
-                      onClick={() => handleCopy(item.index, item.url)}
-                      className="flex h-8 w-8 shrink-0 items-center justify-center border border-[var(--glass-border)] text-[var(--text-color-secondary)] transition-colors hover:bg-[var(--glass-hover)] hover:text-[var(--text-color)] cursor-pointer"
-                      aria-label={`复制${item.name}链接`}
-                      title={copiedLinkKey === getPlaybackLinkKey(item.index, item.url) ? '已复制' : '复制链接'}
-                    >
-                      {copiedLinkKey === getPlaybackLinkKey(item.index, item.url) ? <Check size={15} /> : <Copy size={15} />}
-                    </button>
+                    <LinkDownloadControls
+                      item={item}
+                      isCopied={copiedLinkKey === getPlaybackLinkKey(item.index, item.url)}
+                      onCopy={handleCopy}
+                      downloadState={getDownloadState(item)}
+                      onStartDownload={startDownload}
+                      onCancelDownload={cancelDownload}
+                    />
                   </div>
+                  <DownloadStatus state={getDownloadState(item)} />
                 </div>
               ))}
             </div>
