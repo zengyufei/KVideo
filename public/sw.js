@@ -1,5 +1,6 @@
 const LEGACY_CACHE_PREFIXES = ['video-cache-'];
 const DOWNLOAD_PATH = '/__kvideo-download/';
+const DOWNLOAD_PROTOCOL_VERSION = 2;
 const downloadStreams = new Map();
 
 function downloadHeaders(filename, mimeType) {
@@ -52,6 +53,16 @@ self.addEventListener('activate', (event) => {
 self.addEventListener('message', (event) => {
     const data = event.data || {};
 
+    if (data.type === 'kvideo-skip-waiting') {
+        self.skipWaiting();
+        return;
+    }
+
+    if (data.type === 'kvideo-download-probe') {
+        event.ports[0]?.postMessage({ type: 'protocol', version: DOWNLOAD_PROTOCOL_VERSION });
+        return;
+    }
+
     if (data.type === 'kvideo-download-create') {
         const port = event.ports[0];
         if (!data.id || !data.stream || typeof data.stream.getReader !== 'function') {
@@ -77,7 +88,7 @@ self.addEventListener('message', (event) => {
         // Keep the worker alive until the page closes or aborts this transferred stream.
         // Without this, a browser may discard the worker before the download URL consumes it.
         event.waitUntil(done);
-        port?.postMessage({ type: 'ready' });
+        port?.postMessage({ type: 'ready', version: DOWNLOAD_PROTOCOL_VERSION });
         return;
     }
 

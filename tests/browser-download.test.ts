@@ -19,19 +19,53 @@ async function waitFor<T>(getValue: () => T | undefined): Promise<T> {
   throw new Error('测试下载桥接超时');
 }
 
-function installBrowserMock(): BrowserMock {
+function installBrowserMock({ startWithLegacyWorker = false }: { startWithLegacyWorker?: boolean } = {}): BrowserMock {
   const descriptors = new Map<string, PropertyDescriptor | undefined>();
   const workerMessages: Array<{ type?: string }> = [];
   let attachmentPort: MessagePort | undefined;
   let attachmentTimeout: (() => void) | undefined;
   let downloadFrameInserted = false;
-  const worker = {
+  const controllerChangeListeners = new Set<() => void>();
+  const currentWorker = {
     postMessage(message: { type?: string }, transfers?: Transferable[]) {
       workerMessages.push(message);
+      if (message.type === 'kvideo-download-probe') {
+        const port = transfers?.[0] as MessagePort | undefined;
+        queueMicrotask(() => port?.postMessage({ type: 'protocol', version: 2 }));
+        return;
+      }
       if (message.type !== 'kvideo-download-create') return;
 
       attachmentPort = transfers?.[1] as MessagePort | undefined;
-      queueMicrotask(() => attachmentPort?.postMessage({ type: 'ready' }));
+      queueMicrotask(() => attachmentPort?.postMessage({ type: 'ready', version: 2 }));
+    },
+  };
+  const legacyWorker = {
+    postMessage(message: { type?: string }, transfers?: Transferable[]) {
+      workerMessages.push(message);
+      if (message.type !== 'kvideo-download-probe') return;
+
+      const port = transfers?.[0] as MessagePort | undefined;
+      queueMicrotask(() => port?.postMessage({ type: 'protocol', version: 1 }));
+    },
+  };
+  let controller = startWithLegacyWorker ? legacyWorker : currentWorker;
+  const serviceWorker = {
+    ready: Promise.resolve(undefined),
+    get controller() { return controller; },
+    addEventListener(type: string, listener: () => void) {
+      if (type === 'controllerchange') controllerChangeListeners.add(listener);
+    },
+    removeEventListener(type: string, listener: () => void) {
+      if (type === 'controllerchange') controllerChangeListeners.delete(listener);
+    },
+    async getRegistration() {
+      return {
+        async update() {
+          controller = currentWorker;
+          controllerChangeListeners.forEach((listener) => listener());
+        },
+      };
     },
   };
   const frame = {
@@ -45,7 +79,7 @@ function installBrowserMock(): BrowserMock {
     Object.defineProperty(globalThis, name, { configurable: true, value });
   };
 
-  replaceGlobal('navigator', { serviceWorker: { ready: Promise.resolve(undefined), controller: worker } });
+  replaceGlobal('navigator', { serviceWorker });
   replaceGlobal('window', {
     setTimeout(callback: () => void, timeout: number) {
       if (timeout === 5000) attachmentTimeout = callback;
@@ -91,6 +125,7 @@ test('browser download waits until the Service Worker attaches the download resp
     const session = await sessionPromise;
     await session.abort();
     assert.deepEqual(browser.workerMessages.map((message) => message.type), [
+      'kvideo-download-probe',
       'kvideo-download-create',
       'kvideo-download-abort',
     ]);
@@ -108,6 +143,28 @@ test('browser download stops when the download response never attaches', async (
 
     await assert.rejects(sessionPromise, /下载栏未连接到下载流/);
     assert.deepEqual(browser.workerMessages.map((message) => message.type), [
+      'kvideo-download-probe',
+      'kvideo-download-create',
+      'kvideo-download-abort',
+    ]);
+  } finally {
+    browser.restore();
+  }
+});
+
+test('browser download upgrades an incompatible Service Worker before creating the download stream', async () => {
+  const browser = installBrowserMock({ startWithLegacyWorker: true });
+  try {
+    const sessionPromise = createBrowserDownloadSession({ filename: 'video.ts', mimeType: 'video/mp2t' });
+
+    await waitFor(() => browser.attachmentPort);
+    browser.attachmentPort?.postMessage({ type: 'attached' });
+    const session = await sessionPromise;
+    await session.abort();
+
+    assert.deepEqual(browser.workerMessages.map((message) => message.type), [
+      'kvideo-download-probe',
+      'kvideo-download-probe',
       'kvideo-download-create',
       'kvideo-download-abort',
     ]);

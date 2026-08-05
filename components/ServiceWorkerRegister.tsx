@@ -7,7 +7,7 @@ export function ServiceWorkerRegister() {
         if (!('serviceWorker' in navigator)) return;
 
         const registerServiceWorker = () => {
-            navigator.serviceWorker.register('/sw.js')
+            navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' })
                 .then((registration) => {
                     registration.update().catch(() => {
                         // Ignore update check errors.

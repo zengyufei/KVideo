@@ -2,6 +2,9 @@
 
 export const BROWSER_DOWNLOAD_PATH = '/__kvideo-download/';
 const DOWNLOAD_ATTACH_TIMEOUT_MS = 5000;
+const DOWNLOAD_PROTOCOL_VERSION = 2;
+const DOWNLOAD_PROTOCOL_TIMEOUT_MS = 1500;
+const SERVICE_WORKER_UPDATE_TIMEOUT_MS = 5000;
 
 export interface BrowserDownloadSession {
   write(chunk: Uint8Array): Promise<void>;
@@ -53,6 +56,72 @@ function waitForDownloadServiceWorker(): Promise<ServiceWorker> {
   });
 }
 
+function supportsDownloadProtocol(worker: ServiceWorker): Promise<boolean> {
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    const timeout = window.setTimeout(() => {
+      channel.port1.close();
+      resolve(false);
+    }, DOWNLOAD_PROTOCOL_TIMEOUT_MS);
+
+    channel.port1.onmessage = (event: MessageEvent<{ type?: string; version?: number }>) => {
+      window.clearTimeout(timeout);
+      channel.port1.close();
+      resolve(
+        event.data?.type === 'protocol'
+        && event.data.version === DOWNLOAD_PROTOCOL_VERSION
+      );
+    };
+
+    try {
+      worker.postMessage({ type: 'kvideo-download-probe' }, [channel.port2]);
+    } catch {
+      window.clearTimeout(timeout);
+      channel.port1.close();
+      resolve(false);
+    }
+  });
+}
+
+async function updateDownloadServiceWorker(currentWorker: ServiceWorker): Promise<ServiceWorker> {
+  const registration = await navigator.serviceWorker.getRegistration();
+  if (!registration) {
+    throw new Error('下载服务未注册，请刷新页面后重试');
+  }
+
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      reject(new Error('下载服务版本不一致。Cloudflare 部署尚未更新，请稍后刷新页面重试'));
+    }, SERVICE_WORKER_UPDATE_TIMEOUT_MS);
+    const finish = (worker?: ServiceWorker, error?: Error) => {
+      window.clearTimeout(timeout);
+      navigator.serviceWorker.removeEventListener('controllerchange', handleControllerChange);
+      if (error) reject(error);
+      else if (worker) resolve(worker);
+    };
+    const handleControllerChange = () => {
+      const worker = navigator.serviceWorker.controller;
+      if (worker && worker !== currentWorker) finish(worker);
+    };
+
+    navigator.serviceWorker.addEventListener('controllerchange', handleControllerChange);
+    registration.waiting?.postMessage({ type: 'kvideo-skip-waiting' });
+    void registration.update()
+      .then(handleControllerChange)
+      .catch(() => finish(undefined, new Error('无法更新下载服务，请刷新页面后重试')));
+  });
+}
+
+async function getCompatibleDownloadServiceWorker(): Promise<ServiceWorker> {
+  const worker = await waitForDownloadServiceWorker();
+  if (await supportsDownloadProtocol(worker)) return worker;
+
+  const updatedWorker = await updateDownloadServiceWorker(worker);
+  if (await supportsDownloadProtocol(updatedWorker)) return updatedWorker;
+
+  throw new Error('下载服务版本不一致。Cloudflare 部署尚未更新，请稍后刷新页面重试');
+}
+
 function toDownloadError(error: unknown, fallback: string): Error {
   return error instanceof Error ? error : new Error(fallback);
 }
@@ -61,7 +130,7 @@ export async function createBrowserDownloadSession({
   filename,
   mimeType,
 }: BrowserDownloadOptions): Promise<BrowserDownloadSession> {
-  const worker = await waitForDownloadServiceWorker();
+  const worker = await getCompatibleDownloadServiceWorker();
   const id = createDownloadId();
   const stream = new TransformStream<Uint8Array, Uint8Array>();
   const writer = stream.writable.getWriter();

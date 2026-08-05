@@ -58,7 +58,7 @@ test('download stream creation keeps the Service Worker alive until the stream i
     waitUntil: (promise) => lifetimePromises.push(promise),
   });
 
-  assert.deepEqual(replies, [{ type: 'ready' }]);
+  assert.deepEqual(replies, [{ type: 'ready', version: 2 }]);
   assert.equal(lifetimePromises.length, 1);
 
   let settled = false;
@@ -75,6 +75,20 @@ test('download stream creation keeps the Service Worker alive until the stream i
   await response?.arrayBuffer();
   await lifetimePromises[0];
   assert.equal(settled, true);
+});
+
+test('download Service Worker exposes its compatible protocol version', () => {
+  const message = loadServiceWorker().get('message') as MessageListener | undefined;
+  assert.ok(message);
+
+  const replies: unknown[] = [];
+  message({
+    data: { type: 'kvideo-download-probe' },
+    ports: [{ postMessage: (reply) => replies.push(reply) }],
+    waitUntil: () => undefined,
+  });
+
+  assert.deepEqual(replies, [{ type: 'protocol', version: 2 }]);
 });
 
 test('download response attaches before streaming and preserves every chunk in order', async () => {
