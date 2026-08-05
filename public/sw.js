@@ -11,6 +11,28 @@ function downloadHeaders(filename, mimeType) {
     };
 }
 
+function notify(record, type, message) {
+    try {
+        record.port?.postMessage({ type, ...(message ? { message } : {}) });
+    } catch {
+        // The page can disappear while the browser continues its download.
+    }
+}
+
+function finishDownload(record, state, message) {
+    if (record.finished) return;
+
+    record.finished = true;
+    record.state = state;
+    if (state === 'aborted' && record.reader) {
+        void record.reader.cancel(message).catch(() => undefined);
+    }
+    if (state === 'aborted') notify(record, 'aborted', message || '浏览器下载已取消或下载流已断开');
+    if (state === 'closed') notify(record, 'closed');
+    downloadStreams.delete(record.id);
+    record.finish();
+}
+
 self.addEventListener('install', () => {
     self.skipWaiting();
 });
@@ -42,11 +64,15 @@ self.addEventListener('message', (event) => {
             finish = resolve;
         });
         downloadStreams.set(data.id, {
+            id: data.id,
             stream: data.stream,
             filename: data.filename,
             mimeType: data.mimeType,
+            port,
+            state: 'created',
             done,
             finish,
+            finished: false,
         });
         // Keep the worker alive until the page closes or aborts this transferred stream.
         // Without this, a browser may discard the worker before the download URL consumes it.
@@ -55,9 +81,10 @@ self.addEventListener('message', (event) => {
         return;
     }
 
-    if (data.type === 'kvideo-download-close' || data.type === 'kvideo-download-abort') {
+    if (data.type === 'kvideo-download-abort') {
         const record = downloadStreams.get(data.id);
-        record?.finish();
+        if (!record) return;
+        finishDownload(record, 'aborted', '下载已取消');
     }
 });
 
@@ -74,9 +101,41 @@ self.addEventListener('fetch', (event) => {
         return;
     }
 
-    event.respondWith(new Response(record.stream, {
+    if (record.state !== 'created') {
+        event.respondWith(new Response('Download stream is already attached', { status: 409 }));
+        return;
+    }
+
+    record.reader = record.stream.getReader();
+    record.state = 'attached';
+    const responseStream = new ReadableStream({
+        async pull(controller) {
+            try {
+                const { done, value } = await record.reader.read();
+                if (done) {
+                    controller.close();
+                    finishDownload(record, 'closed');
+                    return;
+                }
+                if (record.state === 'attached') {
+                    record.state = 'streaming';
+                    notify(record, 'streaming');
+                }
+                controller.enqueue(value);
+            } catch (error) {
+                controller.error(error);
+                finishDownload(record, 'aborted', '下载流读取失败');
+            }
+        },
+        async cancel() {
+            finishDownload(record, 'aborted', '浏览器下载已取消或下载流已断开');
+        },
+    });
+
+    event.respondWith(new Response(responseStream, {
         headers: downloadHeaders(record.filename, record.mimeType),
     }));
+    notify(record, 'attached');
     event.waitUntil(record.done.then(() => {
         downloadStreams.delete(id);
     }));
