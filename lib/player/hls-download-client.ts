@@ -57,18 +57,63 @@ export async function fetchHlsMediaResponse(
   }
 
   if (!response.ok) throw createFetchError(response, '视频分片');
-  if (byteRange && response.status !== 206) {
-    throw new HlsDownloadError('上游不支持 HLS 所需的字节范围请求，无法下载');
-  }
   return response;
 }
 
-async function readResponseBytes(response: Response, onBytes: (count: number) => void): Promise<Uint8Array> {
+interface ByteRangeFilter {
+  filter(chunk: Uint8Array): Uint8Array | undefined;
+  isComplete(): boolean;
+  assertComplete(): void;
+}
+
+function createByteRangeFilter(byteRange: HlsByteRange | undefined): ByteRangeFilter {
+  if (!byteRange) {
+    return {
+      filter: (chunk) => chunk,
+      isComplete: () => false,
+      assertComplete() {},
+    };
+  }
+
+  let sourceOffset = 0;
+  let remainingBytes = byteRange.end - byteRange.start + 1;
+
+  return {
+    filter(chunk) {
+      const chunkStart = sourceOffset;
+      sourceOffset += chunk.byteLength;
+      if (remainingBytes <= 0 || chunkStart + chunk.byteLength <= byteRange.start) return undefined;
+
+      const start = Math.max(byteRange.start - chunkStart, 0);
+      const end = Math.min(chunk.byteLength, start + remainingBytes);
+      if (end <= start) return undefined;
+
+      const requestedBytes = chunk.subarray(start, end);
+      remainingBytes -= requestedBytes.byteLength;
+      return requestedBytes;
+    },
+    isComplete: () => remainingBytes === 0,
+    assertComplete() {
+      if (remainingBytes > 0) {
+        throw new HlsDownloadError('上游返回的分片小于清单声明的字节范围');
+      }
+    },
+  };
+}
+
+export async function readResponseBytes(
+  response: Response,
+  onBytes: (count: number) => void,
+  byteRange?: HlsByteRange
+): Promise<Uint8Array> {
+  const rangeFilter = createByteRangeFilter(response.status === 200 ? byteRange : undefined);
   const reader = response.body?.getReader();
   if (!reader) {
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    onBytes(bytes.byteLength);
-    return bytes;
+    const requestedBytes = rangeFilter.filter(new Uint8Array(await response.arrayBuffer()));
+    rangeFilter.assertComplete();
+    if (!requestedBytes) return new Uint8Array();
+    onBytes(requestedBytes.byteLength);
+    return requestedBytes;
   }
 
   const parts: Uint8Array[] = [];
@@ -78,13 +123,22 @@ async function readResponseBytes(response: Response, onBytes: (count: number) =>
       const { done, value } = await reader.read();
       if (done) break;
       if (!value) continue;
-      parts.push(value);
-      totalBytes += value.byteLength;
-      onBytes(value.byteLength);
+      const requestedBytes = rangeFilter.filter(value);
+      if (requestedBytes) {
+        parts.push(requestedBytes);
+        totalBytes += requestedBytes.byteLength;
+        onBytes(requestedBytes.byteLength);
+      }
+      if (rangeFilter.isComplete()) {
+        await reader.cancel();
+        break;
+      }
     }
   } finally {
     reader.releaseLock();
   }
+
+  rangeFilter.assertComplete();
 
   const output = new Uint8Array(totalBytes);
   let offset = 0;
@@ -98,13 +152,23 @@ async function readResponseBytes(response: Response, onBytes: (count: number) =>
 export async function streamResponseToDownload(
   response: Response,
   write: (chunk: Uint8Array) => Promise<void>,
-  onBytes: (count: number) => void
+  onBytes: (count: number) => void,
+  byteRange?: HlsByteRange
 ): Promise<void> {
+  const rangeFilter = createByteRangeFilter(response.status === 200 ? byteRange : undefined);
+
+  const writeRequestedBytes = async (chunk: Uint8Array) => {
+    const requestedBytes = rangeFilter.filter(chunk);
+    if (!requestedBytes) return;
+    await write(requestedBytes);
+    onBytes(requestedBytes.byteLength);
+  };
+
   const reader = response.body?.getReader();
   if (!reader) {
     const bytes = new Uint8Array(await response.arrayBuffer());
-    await write(bytes);
-    onBytes(bytes.byteLength);
+    await writeRequestedBytes(bytes);
+    rangeFilter.assertComplete();
     return;
   }
 
@@ -113,12 +177,17 @@ export async function streamResponseToDownload(
       const { done, value } = await reader.read();
       if (done) break;
       if (!value) continue;
-      await write(value);
-      onBytes(value.byteLength);
+      await writeRequestedBytes(value);
+      if (rangeFilter.isComplete()) {
+        await reader.cancel();
+        break;
+      }
     }
   } finally {
     reader.releaseLock();
   }
+
+  rangeFilter.assertComplete();
 }
 
 async function importAes128Key(key: HlsAes128Key, signal: AbortSignal): Promise<CryptoKey> {
@@ -214,11 +283,11 @@ export async function downloadHlsMedia({
     await processHlsChunks(plan.chunks, async (chunk: HlsDownloadChunk) => {
       const response = await fetchHlsMediaResponse(chunk.url, chunk.byteRange, signal);
       if (chunk.key) {
-        const encrypted = await readResponseBytes(response, recordBytes);
+        const encrypted = await readResponseBytes(response, recordBytes, chunk.byteRange);
         const decrypted = await decryptChunk(encrypted, chunk.key, chunk.sequence, keyCache, signal);
         await session.write(decrypted);
       } else {
-        await streamResponseToDownload(response, session.write, recordBytes);
+        await streamResponseToDownload(response, session.write, recordBytes, chunk.byteRange);
       }
       completedChunks += 1;
       reportProgress(true);

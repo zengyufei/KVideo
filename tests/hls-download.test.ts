@@ -7,7 +7,7 @@ import {
   processHlsChunks,
   resolveHlsDownloadPlan,
 } from '@/lib/player/hls-download';
-import { fetchHlsMediaResponse, streamResponseToDownload } from '@/lib/player/hls-download-client';
+import { fetchHlsMediaResponse, readResponseBytes, streamResponseToDownload } from '@/lib/player/hls-download-client';
 
 test('resolveHlsDownloadPlan selects the highest bandwidth variant and preserves segment order', async () => {
   const manifests: Record<string, string> = {
@@ -175,4 +175,55 @@ test('fetchHlsMediaResponse passes cancellation through to the current segment r
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('byte-range segments stream the requested bytes when an upstream ignores Range and returns 200', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array([0, 1, 2, 3]));
+      controller.enqueue(new Uint8Array([4, 5, 6, 7]));
+      controller.close();
+    },
+  }), { status: 200 });
+
+  try {
+    const response = await fetchHlsMediaResponse(
+      'https://media.example.com/segments.mp4',
+      { start: 2, end: 5 },
+      new AbortController().signal
+    );
+    const written: Uint8Array[] = [];
+
+    await streamResponseToDownload(
+      response,
+      async (chunk) => { written.push(chunk); },
+      () => undefined,
+      { start: 2, end: 5 }
+    );
+
+    assert.deepEqual(written.map((chunk) => [...chunk]), [[2, 3], [4, 5]]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('encrypted byte-range segments keep only the requested bytes when an upstream returns 200', async () => {
+  const response = new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array([0, 1, 2, 3]));
+      controller.enqueue(new Uint8Array([4, 5, 6, 7]));
+      controller.close();
+    },
+  }), { status: 200 });
+  let downloadedBytes = 0;
+
+  const encrypted = await readResponseBytes(
+    response,
+    (count) => { downloadedBytes += count; },
+    { start: 2, end: 5 }
+  );
+
+  assert.deepEqual([...encrypted], [2, 3, 4, 5]);
+  assert.equal(downloadedBytes, 4);
 });

@@ -48,6 +48,9 @@ self.addEventListener('message', (event) => {
             done,
             finish,
         });
+        // Keep the worker alive until the page closes or aborts this transferred stream.
+        // Without this, a browser may discard the worker before the download URL consumes it.
+        event.waitUntil(done);
         port?.postMessage({ type: 'ready' });
         return;
     }
